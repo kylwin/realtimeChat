@@ -149,7 +149,7 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
 
   const webhookUrl = options.webhookUrl ||
     import.meta.env.VITE_WEBHOOK_URL ||
-    'https://ici.zeabur.app/webhook-test/realtime-ai'
+    'https://ici.zeabur.app/webhook/realtime-ai'
 
   // Handle data channel messages
   const handleDataChannelMessage = useCallback((message: any) => {
