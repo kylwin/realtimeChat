@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
-import type { Message, ConnectionStatus, ConversationState } from '@/types'
+import type { Message, ConnectionStatus, ConversationState, AgentAction, CheckReservationResponse } from '@/types'
 
 interface UseRealtimeChatOptions {
   apiKey?: string
@@ -13,6 +13,7 @@ const TEMP_USER_ID = 'temp-user-transcript'
 const TEMP_ASSISTANT_ID = 'temp-assistant-transcript'
 const OPENAI_MODEL = 'gpt-4o-realtime-preview-2024-12-17'
 const DATA_CHANNEL_NAME = 'oai-events'
+const CHECK_RESV_URL = 'https://ici.zeabur.app/webhook/checkResv'
 
 // Helper: Extract client secret from various response formats
 function extractClientSecret(data: string): string | null {
@@ -133,6 +134,74 @@ function replaceTempMessage(
   return [...messages, finalMessage]
 }
 
+// Helper: Check if content contains an action command
+function parseActionCommand(content: string): AgentAction | null {
+  try {
+    // Try to extract JSON from the content
+    const jsonMatch = content.match(/\{[^}]*"action"[^}]*\}/g)
+    if (jsonMatch) {
+      for (const match of jsonMatch) {
+        try {
+          const parsed = JSON.parse(match)
+          if (parsed.action === 'CHECK_AVAILABILITY' && parsed.time) {
+            return parsed as AgentAction
+          }
+        } catch {
+          continue
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error parsing action command:', error)
+  }
+  return null
+}
+
+// Helper: Call reservation check API
+async function checkReservationAvailability(time: string): Promise<CheckReservationResponse> {
+  try {
+    const response = await fetch(CHECK_RESV_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({ time })
+    })
+
+    if (!response.ok) {
+      throw new Error(`API request failed: ${response.status}`)
+    }
+
+    const data = await response.json()
+
+    console.log('📥 Raw API response:', data)
+
+    // Handle response format: { bookTime: "12:00", availability: true/false }
+    // Support multiple field name variations
+    const availabilityValue = data.Availability ?? data.availability ?? data.available ?? false
+
+    const result = {
+      available: availabilityValue,
+      time: data.bookTime ?? time,
+      message: data.message
+    }
+
+    console.log('📦 Parsed result:', {
+      result,
+      availabilityValue,
+      'data.Availability': data.Availability,
+      'data.availability': data.availability,
+      'data.available': data.available
+    })
+
+    return result
+  } catch (error) {
+    console.error('Error checking reservation:', error)
+    throw error
+  }
+}
+
 export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   const [messages, setMessages] = useState<Message[]>([])
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
@@ -146,101 +215,267 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   const currentTranscriptRef = useRef({ user: '', assistant: '' })
   const userMessageTimestampRef = useRef<number | null>(null)
   const assistantMessageTimestampRef = useRef<number | null>(null)
+  const actionProcessingRef = useRef<boolean>(false)
 
   const webhookUrl = options.webhookUrl ||
     import.meta.env.VITE_WEBHOOK_URL ||
     'https://ici.zeabur.app/webhook/realtime-ai'
 
   // Handle data channel messages
-  const handleDataChannelMessage = useCallback((message: any) => {
-    const { type } = message
-
-    // User transcription delta (real-time)
-    if (type === 'conversation.item.input_audio_transcription.delta') {
-      currentTranscriptRef.current.user += message.delta || ''
-
-      if (!userMessageTimestampRef.current) {
-        userMessageTimestampRef.current = Date.now()
+  const handleDataChannelMessage = useCallback(
+    async (message: any) => {
+      const { type } = message
+  
+      // ---- 小工具：封裝一次處理 CHECK_AVAILABILITY 的流程 ----
+      const processCheckAvailability = async (time: string) => {
+        try {
+          console.log('🔍 Checking availability for time:', time)
+          const result = await checkReservationAvailability(time)
+          console.log('✅ Availability check result:', result)
+  
+          if (dataChannelRef.current?.readyState === 'open') {
+            const payload = {
+              bookTime: result.time,
+              Availability: result.available, // false=有位, true=沒位（按 prompts 定義）
+            }
+            const text = `AVAILABILITY_RESULT: ${JSON.stringify(payload)}`
+  
+            console.log('📤 Sending availability result to Realtime AI:', {
+              payload,
+              text,
+              fullResult: result,
+            })
+  
+            const event = {
+              type: 'conversation.item.create',
+              item: {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text }],
+              },
+            }
+  
+            // 把查表結果丟給 Realtime 模型
+            dataChannelRef.current.send(JSON.stringify(event))
+  
+            // ⭐ 查表完成 → 解除靜音（讓「七點有空位」這句可以被說出來）
+            if (audioElementRef.current) {
+              audioElementRef.current.muted = false
+            }
+  
+            // 觸發新的回覆
+            dataChannelRef.current.send(JSON.stringify({ type: 'response.create' }))
+          }
+        } catch (error) {
+          console.error('❌ Error processing CHECK_AVAILABILITY action:', error)
+  
+          if (dataChannelRef.current?.readyState === 'open') {
+            const errorText = 'AVAILABILITY_RESULT: {"error": "查詢失敗，請稍後再試"}'
+            const event = {
+              type: 'conversation.item.create',
+              item: {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: errorText }],
+              },
+            }
+            dataChannelRef.current.send(JSON.stringify(event))
+  
+            if (audioElementRef.current) {
+              audioElementRef.current.muted = false
+            }
+            dataChannelRef.current.send(JSON.stringify({ type: 'response.create' }))
+          }
+        } finally {
+          actionProcessingRef.current = false
+          currentTranscriptRef.current.assistant = ''
+          assistantMessageTimestampRef.current = null
+          setConversationState('listening')
+        }
       }
+  
+      // ------------------------------------------------------------------
+      // 1) 使用者語音轉文字：實時字幕（delta）
+      // ------------------------------------------------------------------
+      if (type === 'conversation.item.input_audio_transcription.delta') {
+        currentTranscriptRef.current.user += message.delta || ''
+  
+        if (!userMessageTimestampRef.current) {
+          userMessageTimestampRef.current = Date.now()
+        }
+  
+        setMessages(prev =>
+          updateOrCreateTempMessage(
+            prev,
+            TEMP_USER_ID,
+            'user',
+            currentTranscriptRef.current.user,
+            userMessageTimestampRef.current!,
+          ),
+        )
+      }
+  
+      // ------------------------------------------------------------------
+      // 2) 使用者語音結束：完成一句話
+      //    👉 不在這裡靜音，是否靜音由「是否進入 TOOL PHASE」決定
+      // ------------------------------------------------------------------
+      else if (type === 'conversation.item.input_audio_transcription.completed') {
+        const userText = message.transcript || currentTranscriptRef.current.user
+        if (userText.trim()) {
+          const finalTimestamp = userMessageTimestampRef.current || Date.now()
+          const finalMessage: Message = {
+            id: `user-${finalTimestamp}`,
+            role: 'user',
+            content: userText.trim(),
+            timestamp: finalTimestamp,
+          }
+  
+          setMessages(prev =>
+            replaceTempMessage(prev, TEMP_USER_ID, finalMessage, TEMP_ASSISTANT_ID),
+          )
+  
+          options.onMessage?.(finalMessage)
+          currentTranscriptRef.current.user = ''
+          userMessageTimestampRef.current = null
+        }
+  
+        setConversationState('processing')
+      }
+  
+      // ------------------------------------------------------------------
+      // 3) AI 語音字幕 delta（實時）
+      //    👉 一般對話：正常顯示 & 播放
+      //       查表輪：先說「請稍等，我幫你查一下。」→ 再吐 JSON → 我們 detect 後靜音 + cancel
+      // ------------------------------------------------------------------
+      else if (type === 'response.audio_transcript.delta') {
+        const delta = message.delta || ''
+        currentTranscriptRef.current.assistant += delta
+  
+        if (!assistantMessageTimestampRef.current) {
+          assistantMessageTimestampRef.current = Date.now()
+        }
+  
+        const currentText = currentTranscriptRef.current.assistant
 
-      setMessages(prev => updateOrCreateTempMessage(
-        prev,
-        TEMP_USER_ID,
-        'user',
-        currentTranscriptRef.current.user,
-        userMessageTimestampRef.current!
-      ))
-    }
+        // ⭐ 提前檢測：只要出現 JSON 的跡象，立即阻止顯示
+        const looksLikeAction =
+          currentText.includes('"action"') ||
+          currentText.includes('CHECK_AVAILABILITY') ||
+          currentText.includes('{"action') ||
+          (currentText.includes('{') && currentText.includes('"time"'))
 
-    // User transcription completed
-    else if (type === 'conversation.item.input_audio_transcription.completed') {
-      const userText = message.transcript || currentTranscriptRef.current.user
-      if (userText.trim()) {
-        const finalTimestamp = userMessageTimestampRef.current || Date.now()
-        const finalMessage: Message = {
-          id: `user-${finalTimestamp}`,
-          role: 'user',
-          content: userText.trim(),
-          timestamp: finalTimestamp
+        // 如果看起來像 action，立即停止顯示到 UI
+        if (looksLikeAction) {
+          // 立即清除暫存訊息（防止 JSON 片段出現在 UI）
+          setMessages(prev => prev.filter(m => m.id !== TEMP_ASSISTANT_ID))
+
+          // 嘗試解析完整的 action
+          const action = parseActionCommand(currentText)
+
+          if (action && action.action === 'CHECK_AVAILABILITY') {
+            // ⭐ 檢測到完整 action：進入查表流程
+            if (!actionProcessingRef.current && dataChannelRef.current?.readyState === 'open') {
+              console.log('🎯 Detected CHECK_AVAILABILITY in delta:', action)
+              actionProcessingRef.current = true
+
+              if (audioElementRef.current) {
+                audioElementRef.current.muted = true
+              }
+
+              dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+
+              // 清空 transcript
+              currentTranscriptRef.current.assistant = ''
+              assistantMessageTimestampRef.current = null
+
+              // 查表（靜音狀態下）
+              processCheckAvailability(action.time)
+            }
+          }
+
+          // ⭐ 只要看起來像 action，就不顯示（即使還沒解析成功）
+          setConversationState('processing')
+          return
         }
 
-        setMessages(prev => replaceTempMessage(
-          prev,
-          TEMP_USER_ID,
-          finalMessage,
-          TEMP_ASSISTANT_ID
-        ))
-
-        options.onMessage?.(finalMessage)
-        currentTranscriptRef.current.user = ''
-        userMessageTimestampRef.current = null
+        // 如果正在處理 action 或目前已靜音，就不更新 UI
+        if (audioElementRef.current?.muted || actionProcessingRef.current) {
+          return
+        }
+  
+        // ⭐ 一般對話：正常 streaming 助理文本
+        setMessages(prev => {
+          const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
+          return updateOrCreateTempMessage(
+            prev,
+            TEMP_ASSISTANT_ID,
+            'assistant',
+            currentTranscriptRef.current.assistant,
+            assistantMessageTimestampRef.current!,
+            tempUserIndex,
+          )
+        })
+        setConversationState('responding')
       }
-      setConversationState('processing')
-    }
-
-    // AI response delta (real-time)
-    else if (type === 'response.audio_transcript.delta') {
-      currentTranscriptRef.current.assistant += message.delta || ''
-
-      if (!assistantMessageTimestampRef.current) {
-        assistantMessageTimestampRef.current = Date.now()
-      }
-
-      setMessages(prev => {
-        const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
-        return updateOrCreateTempMessage(
-          prev,
-          TEMP_ASSISTANT_ID,
-          'assistant',
-          currentTranscriptRef.current.assistant,
-          assistantMessageTimestampRef.current!,
-          tempUserIndex
-        )
-      })
-      setConversationState('responding')
-    }
-
-    // AI response completed
-    else if (type === 'response.audio_transcript.done') {
-      const assistantText = message.transcript || currentTranscriptRef.current.assistant
-      if (assistantText.trim()) {
+  
+      // ------------------------------------------------------------------
+      // 4) AI 語音字幕完成
+      // ------------------------------------------------------------------
+      else if (type === 'response.audio_transcript.done') {
+        const assistantText =
+          message.transcript || currentTranscriptRef.current.assistant
+        const trimmed = assistantText.trim()
+  
+        if (!trimmed) {
+          currentTranscriptRef.current.assistant = ''
+          assistantMessageTimestampRef.current = null
+          setConversationState('listening')
+          return
+        }
+  
+        const action = parseActionCommand(trimmed)
+  
+        // a) 保底：如果在 done 才第一次看到 CHECK_AVAILABILITY
+        if (action && action.action === 'CHECK_AVAILABILITY') {
+          if (!actionProcessingRef.current && dataChannelRef.current?.readyState === 'open') {
+            console.log('🎯 Detected CHECK_AVAILABILITY in done:', action)
+            actionProcessingRef.current = true
+  
+            if (audioElementRef.current) {
+              audioElementRef.current.muted = true
+            }
+  
+            dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+  
+            setMessages(prev => prev.filter(m => m.id !== TEMP_ASSISTANT_ID))
+  
+            processCheckAvailability(action.time)
+          }
+  
+          currentTranscriptRef.current.assistant = ''
+          assistantMessageTimestampRef.current = null
+          return
+        }
+  
+        // b) 正常對話 / 查表後的最終一句話（這時 muted 已在 processCheckAvailability 裡解除）
         const finalTimestamp = assistantMessageTimestampRef.current || Date.now()
         const finalMessage: Message = {
           id: `assistant-${finalTimestamp}`,
           role: 'assistant',
-          content: assistantText.trim(),
-          timestamp: finalTimestamp
+          content: trimmed,
+          timestamp: finalTimestamp,
         }
-
+  
         setMessages(prev => replaceTempMessage(prev, TEMP_ASSISTANT_ID, finalMessage))
-
         options.onMessage?.(finalMessage)
+  
         currentTranscriptRef.current.assistant = ''
         assistantMessageTimestampRef.current = null
+        setConversationState('listening')
       }
-      setConversationState('listening')
-    }
-  }, [options])
+    },
+    [options],
+  )
 
   // Connect to N8N webhook and establish WebRTC
   const connect = useCallback(async () => {
@@ -355,6 +590,7 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
     currentTranscriptRef.current = { user: '', assistant: '' }
     userMessageTimestampRef.current = null
     assistantMessageTimestampRef.current = null
+    actionProcessingRef.current = false
 
     // Reset state
     setMessages([])

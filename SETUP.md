@@ -19,14 +19,26 @@ npm install
 
 ### 2. Configure Environment (Optional)
 
-If your webhook URL is different, create a `.env` file:
+**默认配置（正式环境）:**
+项目已配置使用正式环境 API，无需额外设置：
+```
+https://ici.zeabur.app/webhook/realtime-ai
+```
+
+**切换到测试环境:**
+如需使用测试环境，创建 `.env` 文件：
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and set your webhook URL:
+编辑 `.env` 并设置测试 URL：
 
+```env
+VITE_WEBHOOK_URL=https://ici.zeabur.app/webhook-test/realtime-ai
+```
+
+**使用自定义 URL:**
 ```env
 VITE_WEBHOOK_URL=https://your-n8n-instance.com/webhook/realtime-ai
 ```

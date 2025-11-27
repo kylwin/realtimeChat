@@ -186,10 +186,17 @@ TypeScript definitions for Vite environment variables.
 ## 🔐 Environment Variables
 
 ```env
-VITE_WEBHOOK_URL=https://ici.zeabur.app/webhook-test/realtime-ai
+# 正式环境 (Production) - 当前使用
+VITE_WEBHOOK_URL=https://ici.zeabur.app/webhook/realtime-ai
+
+# 测试环境 (Testing)
+# VITE_WEBHOOK_URL=https://ici.zeabur.app/webhook-test/realtime-ai
 ```
 
-Falls back to default if not specified.
+**环境说明:**
+- **正式环境**: `/webhook/realtime-ai` - N8N workflow 需设置为 production mode
+- **测试环境**: `/webhook-test/realtime-ai` - 需要在 N8N 手动点击 "Execute workflow"
+- 如果不设置此变量，代码会自动使用正式环境 URL
 
 ## 🌐 Browser Support
 

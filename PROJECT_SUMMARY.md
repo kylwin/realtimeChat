@@ -7,6 +7,20 @@
 **技术栈:** React 18 + TypeScript + Vite + Tailwind CSS + WebRTC
 **状态:** ✅ 完成并优化
 
+### 🌐 API 环境配置
+
+**N8N Webhook URLs:**
+- **测试环境:** `https://ici.zeabur.app/webhook-test/realtime-ai`
+- **正式环境:** `https://ici.zeabur.app/webhook/realtime-ai` ✅ (当前使用)
+
+**切换环境方法:**
+1. 编辑 `.env` 文件：
+   ```env
+   VITE_WEBHOOK_URL=https://ici.zeabur.app/webhook/realtime-ai
+   ```
+2. 或修改 `src/hooks/useRealtimeChat.ts` 第 152 行的默认 URL
+3. 重启开发服务器：`npm run dev`
+
 ---
 
 ## 🎯 项目目标

@@ -6,7 +6,20 @@ interface ChatMessageProps {
 
 export default function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === 'user'
+  const isSystem = message.role === 'system'
 
+  // System messages (like checking status)
+  if (isSystem) {
+    return (
+      <div className="flex justify-center mb-4 animate-fadeIn">
+        <div className="bg-gray-100 text-gray-600 text-xs px-4 py-2 rounded-full">
+          {message.content}
+        </div>
+      </div>
+    )
+  }
+
+  // User and assistant messages
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4 animate-fadeIn`}>
       <div className={`flex items-start gap-3 max-w-[80%] ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
