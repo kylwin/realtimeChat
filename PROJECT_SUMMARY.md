@@ -420,5 +420,63 @@ https://claude.com/claude-code"
 
 ---
 
-**项目状态:** ✅ 准备就绪，可以上传到 Git！
-**最后更新:** 2025-11-24
+## 📅 開發日誌
+
+### 2025-11-28 上午：查表功能優化
+
+**問題診斷與解決：**
+
+#### 問題 1: Server 部署後無法調用 API
+- **現象**: localhost 測試正常，但部署到 server 後無法調用遠端 API
+- **排查**:
+  - 新增詳細的 API 錯誤日誌和 CORS headers 檢查
+  - 創建內建診斷工具 `ApiDiagnostics.tsx`
+  - 編寫完整的部署診斷指南
+- **解決方案**:
+  - 增強 fetch 請求的錯誤處理（mode: 'cors'）
+  - 提供 N8N CORS 配置指南
+  - 文檔：`DEPLOYMENT_DEBUG_GUIDE.md`、`QUICK_FIX.md`
+
+#### 問題 2: Token 溢出導致 AI 亂說話
+- **現象**: 查表時 AI 會輸出 JSON 到 TTS，造成用戶聽到多餘內容
+- **原因**: AI 在輸出 JSON action 之前已經開始 TTS
+- **解決方案 - 方案 3**:
+  - 修改 N8N Prompt：AI 不再輸出 JSON，改為說「請稍等，我幫你查一下 [時間]」
+  - 新增 `extractTimeFromAIResponse()` 函數：從 AI 回應中提取時間
+  - 前端檢測觸發詞並提取時間，完全避免 JSON
+  - 利用 AI 的語義理解能力處理模糊時間（"中午"、"晚餐時間"等）
+  - 文檔：`SCHEMA_3_IMPLEMENTATION.md`
+
+#### 問題 3: 查表結果回來太快，觸發句被截斷
+- **現象**: "請稍等，我幫你查一下晚上七（被截斷）"
+- **原因**: 在 delta 階段檢測到觸發詞後立即靜音，但 TTS 還在播放
+- **解決方案 - 方案 C (延遲靜音)**:
+  - Delta 階段：檢測到觸發詞，標記狀態，開始查表，但**不靜音**
+  - Done 階段：句子說完後才靜音並 cancel 後續回應
+  - 確保用戶聽到完整的觸發句
+  - 文檔：`DELAYED_MUTING_UPDATE.md`
+
+**技術改進：**
+- ✅ 完全避免 JSON 輸出到 TTS
+- ✅ Token 不再溢出
+- ✅ 觸發句不會被截斷
+- ✅ 支持模糊時間表達（AI 理解後轉換）
+- ✅ 詳細的 console 日誌方便調試
+- ✅ 內建診斷工具
+
+**構建結果：**
+```
+✓ built in 414ms
+dist/assets/index-C0277Dzz.js   163.97 kB │ gzip: 52.85 kB
+```
+
+**新增文檔：**
+- `DEPLOYMENT_DEBUG_GUIDE.md` - 部署診斷完整指南
+- `QUICK_FIX.md` - 快速修復參考
+- `SCHEMA_3_IMPLEMENTATION.md` - 方案 3 實施文檔
+- `DELAYED_MUTING_UPDATE.md` - 延遲靜音更新說明
+
+---
+
+**项目状态:** ✅ 優化完成，準備部署測試
+**最后更新:** 2025-11-28

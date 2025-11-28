@@ -1,10 +1,13 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useRealtimeChat } from '@/hooks/useRealtimeChat'
 import ChatMessage from './ChatMessage'
 import FloatingActionBar from './FloatingActionBar'
 import ChatInput from './ChatInput'
+import { ApiDiagnostics } from './ApiDiagnostics'
 
 export default function ChatPage() {
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
+
   const {
     messages,
     connectionStatus,
@@ -32,13 +35,23 @@ export default function ChatPage() {
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       {/* Header */}
       <header className="bg-white border-b border-gray-200 shadow-sm">
-        <div className="max-w-6xl mx-auto px-6 py-4">
+        <div className="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
           <div>
             <h1 className="text-2xl font-bold text-gray-900">Realtime Chat</h1>
             <p className="text-sm text-gray-500">OpenAI Realtime API Demo</p>
           </div>
+          <button
+            onClick={() => setShowDiagnostics(!showDiagnostics)}
+            className="px-4 py-2 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded-lg text-sm font-medium transition-colors"
+            title="打開 API 診斷工具"
+          >
+            🔍 診斷工具
+          </button>
         </div>
       </header>
+
+      {/* API Diagnostics Modal */}
+      {showDiagnostics && <ApiDiagnostics />}
 
       {/* Chat Messages Area */}
       <main className="flex-1 overflow-y-auto scrollbar-thin">

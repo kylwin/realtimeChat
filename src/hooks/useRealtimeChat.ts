@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
-import type { Message, ConnectionStatus, ConversationState, AgentAction, CheckReservationResponse } from '@/types'
+import type { Message, ConnectionStatus, ConversationState, CheckReservationResponse } from '@/types'
 
 interface UseRealtimeChatOptions {
   apiKey?: string
@@ -134,34 +134,101 @@ function replaceTempMessage(
   return [...messages, finalMessage]
 }
 
-// Helper: Check if content contains an action command
-function parseActionCommand(content: string): AgentAction | null {
-  try {
-    // Try to extract JSON from the content
-    const jsonMatch = content.match(/\{[^}]*"action"[^}]*\}/g)
-    if (jsonMatch) {
-      for (const match of jsonMatch) {
-        try {
-          const parsed = JSON.parse(match)
-          if (parsed.action === 'CHECK_AVAILABILITY' && parsed.time) {
-            return parsed as AgentAction
-          }
-        } catch {
-          continue
-        }
+// Helper: Extract time from AI's response
+function extractTimeFromAIResponse(text: string): string | null {
+  console.log('🕐 Extracting time from AI response:', text)
+
+  // Special cases first
+  if (text.includes('中午')) {
+    console.log('✅ Detected: 中午 → 12:00')
+    return '12:00'
+  }
+
+  // Pattern: "請稍等，我幫你查一下 [時間]"
+  const patterns = [
+    // 中文時間格式 - 標準點數
+    { regex: /查一下\s*(\d{1,2})\s*點\s*半/, handler: (m: RegExpMatchArray) => {
+      const hour = parseInt(m[1])
+      return `${hour.toString().padStart(2, '0')}:30`
+    }},
+    { regex: /查一下\s*(\d{1,2})\s*點\s*(\d{1,2})\s*分/, handler: (m: RegExpMatchArray) => {
+      const hour = parseInt(m[1])
+      const minute = parseInt(m[2])
+      return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`
+    }},
+    { regex: /查一下\s*(\d{1,2})\s*點(?!\s*半|\s*\d)/, handler: (m: RegExpMatchArray) => {
+      const hour = parseInt(m[1])
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+
+    // 早上/下午/晚上
+    { regex: /查一下\s*早上\s*(\d{1,2})\s*點/, handler: (m: RegExpMatchArray) => {
+      let hour = parseInt(m[1])
+      if (hour === 12) hour = 0
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+    { regex: /查一下\s*下午\s*(\d{1,2})\s*點/, handler: (m: RegExpMatchArray) => {
+      let hour = parseInt(m[1])
+      if (hour < 12) hour += 12
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+    { regex: /查一下\s*晚上\s*(\d{1,2})\s*點/, handler: (m: RegExpMatchArray) => {
+      let hour = parseInt(m[1])
+      if (hour < 12) hour += 12
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+
+    // 24小時制格式
+    { regex: /查一下\s*(\d{1,2}):(\d{2})/, handler: (m: RegExpMatchArray) => {
+      const hour = parseInt(m[1])
+      const minute = parseInt(m[2])
+      return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`
+    }},
+
+    // PM/AM 格式
+    { regex: /查一下\s*(\d{1,2})\s*pm/i, handler: (m: RegExpMatchArray) => {
+      let hour = parseInt(m[1])
+      if (hour < 12) hour += 12
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+    { regex: /查一下\s*(\d{1,2})\s*am/i, handler: (m: RegExpMatchArray) => {
+      let hour = parseInt(m[1])
+      if (hour === 12) hour = 0
+      return `${hour.toString().padStart(2, '0')}:00`
+    }},
+  ]
+
+  // Try each pattern
+  for (const { regex, handler } of patterns) {
+    const match = text.match(regex)
+    if (match) {
+      try {
+        const timeStr = handler(match)
+        console.log(`✅ Extracted time: ${timeStr} from "${text}"`)
+        return timeStr
+      } catch (error) {
+        console.error('Error in time extraction handler:', error)
+        continue
       }
     }
-  } catch (error) {
-    console.error('Error parsing action command:', error)
   }
+
+  console.log('❌ Could not extract time from AI response')
   return null
 }
 
 // Helper: Call reservation check API
 async function checkReservationAvailability(time: string): Promise<CheckReservationResponse> {
+  console.log('🌐 Calling reservation API:', {
+    url: CHECK_RESV_URL,
+    time,
+    timestamp: new Date().toISOString()
+  })
+
   try {
     const response = await fetch(CHECK_RESV_URL, {
       method: 'POST',
+      mode: 'cors',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
@@ -169,8 +236,20 @@ async function checkReservationAvailability(time: string): Promise<CheckReservat
       body: JSON.stringify({ time })
     })
 
+    console.log('📡 API response received:', {
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+      headers: {
+        'content-type': response.headers.get('content-type'),
+        'access-control-allow-origin': response.headers.get('access-control-allow-origin')
+      }
+    })
+
     if (!response.ok) {
-      throw new Error(`API request failed: ${response.status}`)
+      const errorText = await response.text()
+      console.error('❌ API error response:', errorText)
+      throw new Error(`API request failed: ${response.status} ${response.statusText}`)
     }
 
     const data = await response.json()
@@ -197,7 +276,12 @@ async function checkReservationAvailability(time: string): Promise<CheckReservat
 
     return result
   } catch (error) {
-    console.error('Error checking reservation:', error)
+    console.error('❌ Error checking reservation:', {
+      error,
+      errorName: error instanceof Error ? error.name : 'Unknown',
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined
+    })
     throw error
   }
 }
@@ -344,66 +428,72 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   
       // ------------------------------------------------------------------
       // 3) AI 語音字幕 delta（實時）
-      //    👉 一般對話：正常顯示 & 播放
-      //       查表輪：先說「請稍等，我幫你查一下。」→ 再吐 JSON → 我們 detect 後靜音 + cancel
+      //    👉 新邏輯：檢測「請稍等，我幫你查一下 [時間]」觸發查表
       // ------------------------------------------------------------------
       else if (type === 'response.audio_transcript.delta') {
         const delta = message.delta || ''
         currentTranscriptRef.current.assistant += delta
-  
+
         if (!assistantMessageTimestampRef.current) {
           assistantMessageTimestampRef.current = Date.now()
         }
-  
+
         const currentText = currentTranscriptRef.current.assistant
 
-        // ⭐ 提前檢測：只要出現 JSON 的跡象，立即阻止顯示
-        const looksLikeAction =
-          currentText.includes('"action"') ||
-          currentText.includes('CHECK_AVAILABILITY') ||
-          currentText.includes('{"action') ||
-          (currentText.includes('{') && currentText.includes('"time"'))
+        // ⭐ 新檢測邏輯：檢測「請稍等，我幫你查一下」
+        const isTriggerPhrase = currentText.includes('請稍等') && currentText.includes('查一下')
 
-        // 如果看起來像 action，立即停止顯示到 UI
-        if (looksLikeAction) {
-          // 立即清除暫存訊息（防止 JSON 片段出現在 UI）
-          setMessages(prev => prev.filter(m => m.id !== TEMP_ASSISTANT_ID))
+        if (isTriggerPhrase) {
+          console.log('🎯 Detected trigger phrase in delta:', currentText)
 
-          // 嘗試解析完整的 action
-          const action = parseActionCommand(currentText)
+          // 嘗試提取時間
+          const extractedTime = extractTimeFromAIResponse(currentText)
 
-          if (action && action.action === 'CHECK_AVAILABILITY') {
-            // ⭐ 檢測到完整 action：進入查表流程
-            if (!actionProcessingRef.current && dataChannelRef.current?.readyState === 'open') {
-              console.log('🎯 Detected CHECK_AVAILABILITY in delta:', action)
-              actionProcessingRef.current = true
+          if (extractedTime && !actionProcessingRef.current) {
+            // ✅ 成功提取到時間，進入查表流程
+            console.log('🎯 Time extracted, entering tool phase:', extractedTime)
+            actionProcessingRef.current = true
 
-              if (audioElementRef.current) {
-                audioElementRef.current.muted = true
-              }
+            // ⭐ 不立即靜音，讓當前句子說完
+            // 靜音會在 response.audio_transcript.done 時執行
 
-              dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+            // ⭐ 也不立即 cancel，讓當前回應說完
+            // 阻止後續新的回應會在 done 時處理
 
-              // 清空 transcript
-              currentTranscriptRef.current.assistant = ''
-              assistantMessageTimestampRef.current = null
+            // 保留已說的話（"請稍等，我幫你查一下 12點"）在 UI 上
+            const finalTimestamp = assistantMessageTimestampRef.current || Date.now()
+            setMessages(prev => {
+              const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
+              return updateOrCreateTempMessage(
+                prev,
+                TEMP_ASSISTANT_ID,
+                'assistant',
+                currentText, // 顯示完整的觸發句
+                finalTimestamp,
+                tempUserIndex,
+              )
+            })
 
-              // 查表（靜音狀態下）
-              processCheckAvailability(action.time)
-            }
+            // 清空 transcript 準備接收查表結果的回應
+            currentTranscriptRef.current.assistant = ''
+            assistantMessageTimestampRef.current = null
+
+            // 立即開始查表（並行進行）
+            processCheckAvailability(extractedTime)
+
+            return // 重要：阻止後續處理
           }
 
-          // ⭐ 只要看起來像 action，就不顯示（即使還沒解析成功）
-          setConversationState('processing')
-          return
+          // 如果還沒提取到完整時間，繼續累積文本
+          // （可能 AI 還在說 "請稍等，我幫你查一下..."，時間還沒說完）
         }
 
-        // 如果正在處理 action 或目前已靜音，就不更新 UI
+        // 如果正在處理 action 或已靜音，不更新 UI
         if (audioElementRef.current?.muted || actionProcessingRef.current) {
           return
         }
-  
-        // ⭐ 一般對話：正常 streaming 助理文本
+
+        // ⭐ 正常對話：streaming 助理文本
         setMessages(prev => {
           const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
           return updateOrCreateTempMessage(
@@ -422,42 +512,69 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
       // 4) AI 語音字幕完成
       // ------------------------------------------------------------------
       else if (type === 'response.audio_transcript.done') {
-        const assistantText =
-          message.transcript || currentTranscriptRef.current.assistant
+        const assistantText = message.transcript || currentTranscriptRef.current.assistant
         const trimmed = assistantText.trim()
-  
+
         if (!trimmed) {
           currentTranscriptRef.current.assistant = ''
           assistantMessageTimestampRef.current = null
           setConversationState('listening')
           return
         }
-  
-        const action = parseActionCommand(trimmed)
-  
-        // a) 保底：如果在 done 才第一次看到 CHECK_AVAILABILITY
-        if (action && action.action === 'CHECK_AVAILABILITY') {
-          if (!actionProcessingRef.current && dataChannelRef.current?.readyState === 'open') {
-            console.log('🎯 Detected CHECK_AVAILABILITY in done:', action)
+
+        // ⭐ 檢查是否為查表觸發句剛說完
+        if (actionProcessingRef.current) {
+          console.log('🔇 Trigger sentence completed, muting audio and canceling further responses')
+
+          // 現在靜音（當前句子已經說完了）
+          if (audioElementRef.current) {
+            audioElementRef.current.muted = true
+          }
+
+          // 取消後續回應（避免 AI 繼續說多餘的話）
+          if (dataChannelRef.current?.readyState === 'open') {
+            dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+          }
+
+          // 清空 transcript，等待查表結果
+          currentTranscriptRef.current.assistant = ''
+          assistantMessageTimestampRef.current = null
+          setConversationState('processing')
+          return
+        }
+
+        // ⭐ 保底檢測：如果 delta 階段沒檢測到，在 done 時檢測
+        const isTriggerPhrase = trimmed.includes('請稍等') && trimmed.includes('查一下')
+
+        if (isTriggerPhrase) {
+          console.log('🎯 Detected trigger phrase in done (fallback):', trimmed)
+
+          const extractedTime = extractTimeFromAIResponse(trimmed)
+
+          if (extractedTime && dataChannelRef.current?.readyState === 'open') {
+            console.log('🎯 Time extracted in done, entering tool phase:', extractedTime)
             actionProcessingRef.current = true
-  
+
+            // 立即靜音並 cancel
             if (audioElementRef.current) {
               audioElementRef.current.muted = true
             }
-  
+
             dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
-  
+
+            // 清理 UI 中的臨時消息（如果有的話）
             setMessages(prev => prev.filter(m => m.id !== TEMP_ASSISTANT_ID))
-  
-            processCheckAvailability(action.time)
+
+            processCheckAvailability(extractedTime)
+
+            currentTranscriptRef.current.assistant = ''
+            assistantMessageTimestampRef.current = null
+            setConversationState('processing')
+            return
           }
-  
-          currentTranscriptRef.current.assistant = ''
-          assistantMessageTimestampRef.current = null
-          return
         }
-  
-        // b) 正常對話 / 查表後的最終一句話（這時 muted 已在 processCheckAvailability 裡解除）
+
+        // ⭐ 正常對話：完成最終消息
         const finalTimestamp = assistantMessageTimestampRef.current || Date.now()
         const finalMessage: Message = {
           id: `assistant-${finalTimestamp}`,
@@ -465,10 +582,10 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
           content: trimmed,
           timestamp: finalTimestamp,
         }
-  
+
         setMessages(prev => replaceTempMessage(prev, TEMP_ASSISTANT_ID, finalMessage))
         options.onMessage?.(finalMessage)
-  
+
         currentTranscriptRef.current.assistant = ''
         assistantMessageTimestampRef.current = null
         setConversationState('listening')
@@ -482,23 +599,43 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
     try {
       setConnectionStatus('connecting')
 
+      console.log('🔌 Connecting to webhook:', {
+        url: webhookUrl,
+        timestamp: new Date().toISOString()
+      })
+
       // Fetch session token from N8N
       const response = await fetch(webhookUrl, {
         method: 'GET',
+        mode: 'cors',
         headers: { 'Accept': 'application/json' }
       })
 
+      console.log('📡 Webhook response:', {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok,
+        headers: {
+          'content-type': response.headers.get('content-type'),
+          'access-control-allow-origin': response.headers.get('access-control-allow-origin')
+        }
+      })
+
       if (!response.ok) {
-        throw new Error(`Failed to connect to webhook: ${response.status}`)
+        const errorText = await response.text()
+        console.error('❌ Webhook error:', errorText)
+        throw new Error(`Failed to connect to webhook: ${response.status} ${response.statusText}`)
       }
 
       const data = await response.text()
       const clientSecret = extractClientSecret(data)
 
       if (!clientSecret) {
-        console.error('Response:', data)
+        console.error('❌ Could not extract client_secret from response:', data)
         throw new Error('Could not find client_secret in response')
       }
+
+      console.log('✅ Client secret obtained successfully')
 
       // Set up WebRTC peer connection
       const peerConnection = new RTCPeerConnection()
