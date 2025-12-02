@@ -136,11 +136,8 @@ function replaceTempMessage(
 
 // Helper: Extract time from AI's response
 function extractTimeFromAIResponse(text: string): string | null {
-  console.log('🕐 Extracting time from AI response:', text)
-
   // Special cases first
   if (text.includes('中午')) {
-    console.log('✅ Detected: 中午 → 12:00')
     return '12:00'
   }
 
@@ -203,28 +200,19 @@ function extractTimeFromAIResponse(text: string): string | null {
     const match = text.match(regex)
     if (match) {
       try {
-        const timeStr = handler(match)
-        console.log(`✅ Extracted time: ${timeStr} from "${text}"`)
-        return timeStr
+        return handler(match)
       } catch (error) {
-        console.error('Error in time extraction handler:', error)
+        console.error('❌ 時間提取錯誤:', error)
         continue
       }
     }
   }
 
-  console.log('❌ Could not extract time from AI response')
   return null
 }
 
 // Helper: Call reservation check API
 async function checkReservationAvailability(time: string): Promise<CheckReservationResponse> {
-  console.log('🌐 Calling reservation API:', {
-    url: CHECK_RESV_URL,
-    time,
-    timestamp: new Date().toISOString()
-  })
-
   try {
     const response = await fetch(CHECK_RESV_URL, {
       method: 'POST',
@@ -236,52 +224,21 @@ async function checkReservationAvailability(time: string): Promise<CheckReservat
       body: JSON.stringify({ time })
     })
 
-    console.log('📡 API response received:', {
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok,
-      headers: {
-        'content-type': response.headers.get('content-type'),
-        'access-control-allow-origin': response.headers.get('access-control-allow-origin')
-      }
-    })
-
     if (!response.ok) {
-      const errorText = await response.text()
-      console.error('❌ API error response:', errorText)
-      throw new Error(`API request failed: ${response.status} ${response.statusText}`)
+      console.error('❌ API 錯誤:', response.status, response.statusText)
+      throw new Error(`API request failed: ${response.status}`)
     }
 
     const data = await response.json()
-
-    console.log('📥 Raw API response:', data)
-
-    // Handle response format: { bookTime: "12:00", availability: true/false }
-    // Support multiple field name variations
     const availabilityValue = data.Availability ?? data.availability ?? data.available ?? false
 
-    const result = {
+    return {
       available: availabilityValue,
       time: data.bookTime ?? time,
       message: data.message
     }
-
-    console.log('📦 Parsed result:', {
-      result,
-      availabilityValue,
-      'data.Availability': data.Availability,
-      'data.availability': data.availability,
-      'data.available': data.available
-    })
-
-    return result
   } catch (error) {
-    console.error('❌ Error checking reservation:', {
-      error,
-      errorName: error instanceof Error ? error.name : 'Unknown',
-      errorMessage: error instanceof Error ? error.message : String(error),
-      errorStack: error instanceof Error ? error.stack : undefined
-    })
+    console.error('❌ 查詢失敗:', error instanceof Error ? error.message : String(error))
     throw error
   }
 }
@@ -301,6 +258,12 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   const assistantMessageTimestampRef = useRef<number | null>(null)
   const actionProcessingRef = useRef<boolean>(false)
 
+  const greetedRef = useRef(false)
+
+  // Response ID tracking - 用於過濾舊的音頻
+  const currentResponseIdRef = useRef<string | null>(null)
+  const waitingForNewResponseRef = useRef<boolean>(false)
+
   const webhookUrl = options.webhookUrl ||
     import.meta.env.VITE_WEBHOOK_URL ||
     'https://ici.zeabur.app/webhook/realtime-ai'
@@ -309,27 +272,37 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   const handleDataChannelMessage = useCallback(
     async (message: any) => {
       const { type } = message
-  
+
+      // ---- 打斷模型：停止當前回應 + 清空音頻緩衝區 ----
+      const interruptModel = (reason?: string) => {
+        if (!dataChannelRef.current || dataChannelRef.current.readyState !== 'open') return
+
+        console.log('🛑 打斷模型', reason || '')
+
+        // 停掉當前正在生成的回應
+        dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
+
+        // 清掉已經緩沖但還沒播完的音頻
+        dataChannelRef.current.send(JSON.stringify({ type: 'output_audio_buffer.clear' }))
+
+        // 可選：也順便把本地字幕狀態清一下
+        currentTranscriptRef.current.assistant = ''
+        assistantMessageTimestampRef.current = null
+      }
+
       // ---- 小工具：封裝一次處理 CHECK_AVAILABILITY 的流程 ----
       const processCheckAvailability = async (time: string) => {
         try {
-          console.log('🔍 Checking availability for time:', time)
           const result = await checkReservationAvailability(time)
-          console.log('✅ Availability check result:', result)
-  
+          console.log('✅ 查詢結果:', time, result.available ? '無空位' : '有空位')
+
           if (dataChannelRef.current?.readyState === 'open') {
             const payload = {
               bookTime: result.time,
               Availability: result.available, // false=有位, true=沒位（按 prompts 定義）
             }
             const text = `AVAILABILITY_RESULT: ${JSON.stringify(payload)}`
-  
-            console.log('📤 Sending availability result to Realtime AI:', {
-              payload,
-              text,
-              fullResult: result,
-            })
-  
+
             const event = {
               type: 'conversation.item.create',
               item: {
@@ -338,21 +311,26 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
                 content: [{ type: 'input_text', text }],
               },
             }
-  
-            // 把查表結果丟給 Realtime 模型
+
+            // 清空 AI 的音頻隊列，避免播放舊的音頻緩存
+            interruptModel('查表完成，準備發送結果')
+            await new Promise(resolve => setTimeout(resolve, 100))
+
+            // 發送查表結果給 AI
             dataChannelRef.current.send(JSON.stringify(event))
-  
-            // ⭐ 查表完成 → 解除靜音（讓「七點有空位」這句可以被說出來）
-            if (audioElementRef.current) {
-              audioElementRef.current.muted = false
-            }
-  
+
+            // ⭐ 關鍵改進：觸發新回應，但不立即解除靜音
+            // 等待 response.created 事件（表示新回應開始）才解除靜音
+            // 這樣可以確保播放的是新回應的音頻，而不是舊的緩存音頻
+            waitingForNewResponseRef.current = true
+            console.log('⏳ 等待新回應開始...')
+
             // 觸發新的回覆
             dataChannelRef.current.send(JSON.stringify({ type: 'response.create' }))
           }
         } catch (error) {
-          console.error('❌ Error processing CHECK_AVAILABILITY action:', error)
-  
+          console.error('❌ 查詢錯誤:', error)
+
           if (dataChannelRef.current?.readyState === 'open') {
             const errorText = 'AVAILABILITY_RESULT: {"error": "查詢失敗，請稍後再試"}'
             const event = {
@@ -363,11 +341,15 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
                 content: [{ type: 'input_text', text: errorText }],
               },
             }
+
+            // 清空隊列並發送錯誤結果
+            interruptModel('查詢錯誤')
+            await new Promise(resolve => setTimeout(resolve, 100))
             dataChannelRef.current.send(JSON.stringify(event))
-  
-            if (audioElementRef.current) {
-              audioElementRef.current.muted = false
-            }
+
+            // 錯誤情況也等待新回應才解除靜音
+            waitingForNewResponseRef.current = true
+
             dataChannelRef.current.send(JSON.stringify({ type: 'response.create' }))
           }
         } finally {
@@ -377,11 +359,41 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
           setConversationState('listening')
         }
       }
-  
+
+      // ------------------------------------------------------------------
+      // 0) Response Created - 記錄當前 response ID，用於過濾舊音頻
+      // ------------------------------------------------------------------
+      if (type === 'response.created') {
+        const responseId = message.response?.id
+        if (responseId) {
+          currentResponseIdRef.current = responseId
+          console.log('🆕 新回應開始:', responseId)
+
+          // 不管是不是查表結果，一旦有新回應開始就確保聲音是開的
+          if (audioElementRef.current) {
+            audioElementRef.current.muted = false
+          }
+          waitingForNewResponseRef.current = false
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // 0.5) 使用者開始說話：打斷當前 AI 語音
+      // ------------------------------------------------------------------
+      else if (type === 'input_audio_buffer.speech_started') {
+        console.log('🗣 用戶開始說話，打斷當前回應')
+        interruptModel('用戶插話')
+
+        // 不再強制靜音，因為 output_audio_buffer.clear 已經把舊音頻清掉了
+        // 如果你真的很放心，可以先暫時靜音再立刻解除，但通常沒必要
+
+        // 略過後續，等新的 ASR delta 來更新 user 字幕即可
+      }
+
       // ------------------------------------------------------------------
       // 1) 使用者語音轉文字：實時字幕（delta）
       // ------------------------------------------------------------------
-      if (type === 'conversation.item.input_audio_transcription.delta') {
+      else if (type === 'conversation.item.input_audio_transcription.delta') {
         currentTranscriptRef.current.user += message.delta || ''
   
         if (!userMessageTimestampRef.current) {
@@ -428,7 +440,6 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
   
       // ------------------------------------------------------------------
       // 3) AI 語音字幕 delta（實時）
-      //    👉 新邏輯：檢測「請稍等，我幫你查一下 [時間]」觸發查表
       // ------------------------------------------------------------------
       else if (type === 'response.audio_transcript.delta') {
         const delta = message.delta || ''
@@ -438,62 +449,12 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
           assistantMessageTimestampRef.current = Date.now()
         }
 
-        const currentText = currentTranscriptRef.current.assistant
-
-        // ⭐ 新檢測邏輯：檢測「請稍等，我幫你查一下」
-        const isTriggerPhrase = currentText.includes('請稍等') && currentText.includes('查一下')
-
-        if (isTriggerPhrase) {
-          console.log('🎯 Detected trigger phrase in delta:', currentText)
-
-          // 嘗試提取時間
-          const extractedTime = extractTimeFromAIResponse(currentText)
-
-          if (extractedTime && !actionProcessingRef.current) {
-            // ✅ 成功提取到時間，進入查表流程
-            console.log('🎯 Time extracted, entering tool phase:', extractedTime)
-            actionProcessingRef.current = true
-
-            // ⭐ 不立即靜音，讓當前句子說完
-            // 靜音會在 response.audio_transcript.done 時執行
-
-            // ⭐ 也不立即 cancel，讓當前回應說完
-            // 阻止後續新的回應會在 done 時處理
-
-            // 保留已說的話（"請稍等，我幫你查一下 12點"）在 UI 上
-            const finalTimestamp = assistantMessageTimestampRef.current || Date.now()
-            setMessages(prev => {
-              const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
-              return updateOrCreateTempMessage(
-                prev,
-                TEMP_ASSISTANT_ID,
-                'assistant',
-                currentText, // 顯示完整的觸發句
-                finalTimestamp,
-                tempUserIndex,
-              )
-            })
-
-            // 清空 transcript 準備接收查表結果的回應
-            currentTranscriptRef.current.assistant = ''
-            assistantMessageTimestampRef.current = null
-
-            // 立即開始查表（並行進行）
-            processCheckAvailability(extractedTime)
-
-            return // 重要：阻止後續處理
-          }
-
-          // 如果還沒提取到完整時間，繼續累積文本
-          // （可能 AI 還在說 "請稍等，我幫你查一下..."，時間還沒說完）
-        }
-
-        // 如果正在處理 action 或已靜音，不更新 UI
-        if (audioElementRef.current?.muted || actionProcessingRef.current) {
+        // 如果正在處理查表，不更新 UI
+        if (actionProcessingRef.current) {
           return
         }
 
-        // ⭐ 正常對話：streaming 助理文本
+        // 正常對話：streaming 助理文本
         setMessages(prev => {
           const tempUserIndex = prev.findIndex(m => m.id === TEMP_USER_ID)
           return updateOrCreateTempMessage(
@@ -522,49 +483,32 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
           return
         }
 
-        // ⭐ 檢查是否為查表觸發句剛說完
-        if (actionProcessingRef.current) {
-          console.log('🔇 Trigger sentence completed, muting audio and canceling further responses')
-
-          // 現在靜音（當前句子已經說完了）
-          if (audioElementRef.current) {
-            audioElementRef.current.muted = true
-          }
-
-          // 取消後續回應（避免 AI 繼續說多餘的話）
-          if (dataChannelRef.current?.readyState === 'open') {
-            dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
-          }
-
-          // 清空 transcript，等待查表結果
-          currentTranscriptRef.current.assistant = ''
-          assistantMessageTimestampRef.current = null
-          setConversationState('processing')
-          return
-        }
-
-        // ⭐ 保底檢測：如果 delta 階段沒檢測到，在 done 時檢測
+        // ⭐ 檢測是否為查表觸發句
         const isTriggerPhrase = trimmed.includes('請稍等') && trimmed.includes('查一下')
 
-        if (isTriggerPhrase) {
-          console.log('🎯 Detected trigger phrase in done (fallback):', trimmed)
-
+        if (isTriggerPhrase && !actionProcessingRef.current) {
           const extractedTime = extractTimeFromAIResponse(trimmed)
 
           if (extractedTime && dataChannelRef.current?.readyState === 'open') {
-            console.log('🎯 Time extracted in done, entering tool phase:', extractedTime)
+            console.log('🔍 查表請求:', extractedTime)
             actionProcessingRef.current = true
 
-            // 立即靜音並 cancel
-            if (audioElementRef.current) {
-              audioElementRef.current.muted = true
+            // 不再強制靜音，因為 output_audio_buffer.clear 已經把舊音頻頻清掉了
+            // 如果你真的很放心，可以先暫時靜音再立刻解除，但通常沒必要
+
+            interruptModel('觸發查表')
+
+            // 保留觸發句在 UI 上
+            const finalTimestamp = assistantMessageTimestampRef.current || Date.now()
+            const finalMessage: Message = {
+              id: `assistant-${finalTimestamp}`,
+              role: 'assistant',
+              content: trimmed,
+              timestamp: finalTimestamp,
             }
+            setMessages(prev => replaceTempMessage(prev, TEMP_ASSISTANT_ID, finalMessage))
 
-            dataChannelRef.current.send(JSON.stringify({ type: 'response.cancel' }))
-
-            // 清理 UI 中的臨時消息（如果有的話）
-            setMessages(prev => prev.filter(m => m.id !== TEMP_ASSISTANT_ID))
-
+            // 開始查表
             processCheckAvailability(extractedTime)
 
             currentTranscriptRef.current.assistant = ''
@@ -662,9 +606,22 @@ export function useRealtimeChat(options: UseRealtimeChatOptions = {}) {
       const dataChannel = peerConnection.createDataChannel(DATA_CHANNEL_NAME)
       dataChannelRef.current = dataChannel
 
+
+
       dataChannel.onopen = () => {
         setConnectionStatus('connected')
         setConversationState('idle')
+      
+        if (!greetedRef.current) {
+          greetedRef.current = true
+          dataChannel.send(JSON.stringify({
+            type: 'response.create',
+            response: {
+              instructions: '請直接以自然語氣說：「你好，歡迎您致電定謙酒館訂位專線，請問您想訂幾點的位子呢？」只說這一句，說完後安靜等待對方回答，不要多說其他內容。'
+            }
+          }))
+          setConversationState('responding')
+        }
       }
 
       dataChannel.onmessage = (event) => {
